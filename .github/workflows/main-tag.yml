@@ -1,0 +1,34 @@
+name: Tag and release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.head_commit.message, 'chore') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Set up Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      # Install semantic-release and plugins
+      - name: Install semantic-release
+        run: npm install -g semantic-release @semantic-release/github conventional-changelog-conventionalcommits
+
+      # Run semantic-release
+      - name: Run semantic-release
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+          DEBUG: "semantic-release:*"
+        run: |
+          semantic-release
+
+          

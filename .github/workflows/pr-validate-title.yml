@@ -1,0 +1,145 @@
+name: "PR Commit Checks"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - dev
+      - fix/pr-checker
+
+env:
+  SKIP_BASE_BRANCH: main
+   
+jobs:
+  validate-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if validation should be skipped
+        id: pr-check
+        run: |
+          if [[ "${{ github.event.pull_request.head.ref }}" == ${{ env.SKIP_BASE_BRANCH }} ]]; then
+            echo "Skipping validation for PR from ${{ env.SKIP_BASE_BRANCH }} branch."
+            echo "skip_validation=true" >> $GITHUB_OUTPUT
+          else
+            echo "Proceeding with validation."
+            echo "skip_validation=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout code
+        if: steps.pr-check.outputs.skip_validation != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+ 
+      - name: Check PR commit count (excluding merge commits)
+        if: steps.pr-check.outputs.skip_validation != 'true'
+        id: commit-count
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prCommits = await github.paginate(
+              github.rest.pulls.listCommits,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number
+              }
+            );
+            console.log({prCommits});
+            // Filter out merge commits (commits with more than one parent)
+            const nonMergeCommits = prCommits.filter(commit => commit.parents.length === 1);
+            console.log({nonMergeCommits});
+            const commitCount = nonMergeCommits.length;
+            const maxCommits = 1;
+
+            let commitCountStatus = commitCount > maxCommits
+              ? `❌ PR has ${commitCount} non-merge commits; maximum allowed is ${maxCommits}. Please squash your commits.`
+              : `✅ PR has ${commitCount} non-merge commits (<= ${maxCommits}).`;
+
+            if (commitCount > maxCommits) {
+              core.setFailed(`PR has ${commitCount} non-merge commits; maximum allowed is ${maxCommits}.`);
+            }
+
+            core.setOutput('commit_count_status', commitCountStatus);
+            core.setOutput('has_single_commit', commitCount === 1);
+
+      - name: Commit message check
+        id: commit-check
+        if: steps.commit-count.outputs.has_single_commit == 'true'
+        run: |
+          git log -1 --pretty=%B > /tmp/msg
+          if sh .githooks/commit-msg /tmp/msg; then
+            echo "Commit message is valid."
+            echo "VALIDATION_PASSED=true" >> $GITHUB_ENV
+          else
+            echo "Commit message validation failed."
+            echo "VALIDATION_PASSED=false" >> $GITHUB_ENV
+            echo "COMMIT_MSG=$(cat /tmp/msg)" >> $GITHUB_ENV
+            exit 1
+          fi
+
+      - name: Manage PR validation comment
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isSkipped = '${{ steps.pr-check.outputs.skip_validation }}' === 'true';
+
+            if (isSkipped) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: `✅ PR is from \`main\` branch — skipping commit validation.\n\n<!-- pr-validation-bot -->`
+              });
+              return;
+            }
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number
+            });
+            
+            const marker = '<!-- pr-validation-bot -->';
+            let existingComment = comments.data.find(comment => comment.body.includes(marker));
+            
+            const commitMsg = process.env.COMMIT_MSG || 'Unknown commit message';
+            const commitCountStatus = '${{ steps.commit-count.outputs.commit_count_status }}';
+            const hasSingleCommit = '${{ steps.commit-count.outputs.has_single_commit }}';
+            
+            let newBody = `## PR Validation Results\n\n`;
+            newBody += `### 1. Commit Count Check\n${commitCountStatus}\n\n`;
+            
+            if (hasSingleCommit === 'true') {
+              newBody += `### 2. Commit Message Check\n`;
+              if (process.env.VALIDATION_PASSED === 'true') {
+                newBody += `✅ The commit message is valid.`;
+              } else {
+                newBody += `❌ The commit message does not follow the required format:\n\n\`\`\`\n${commitMsg}\n\`\`\`\n\n**Expected Format**: \`<type>(<scope>): <description>\` or \`<type>: <description>\`\n\n**Valid Types**: feat, fix, perf, style, revert, docs, refactor, test, build, ci, chore\n\n**Example**: \`feat: add user registration endpoint MIS-123\`\n\nPlease amend your commit message. See [documentation](https://mistodigital.atlassian.net/wiki/x/AgAdD) for details.`;
+              }
+            } else {
+              newBody += `### 2. Commit Message Check\nℹ️ Skipped: Commit message check is only performed when there is exactly one commit.`;
+            }
+            
+            newBody += `\n\n${marker}`;
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: newBody
+              });
+              console.log(`Updated existing validation comment (ID: ${existingComment.id})`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: newBody
+              });
+              console.log(`Posted new validation comment`);
+            }
+            
