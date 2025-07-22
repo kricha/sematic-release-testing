@@ -1,5 +1,5 @@
 {
-    "branches": ["main", "fix/semantic-release"],
+    "branches": ["main"],
     "tagFormat": "${version}",
     "plugins": [
         [
